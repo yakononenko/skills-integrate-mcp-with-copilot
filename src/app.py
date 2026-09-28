@@ -7,6 +7,7 @@ for extracurricular activities at Mergington High School.
 
 import json
 import secrets
+import sqlite3
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -24,6 +25,8 @@ current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
 
+database_path = Path(os.getenv("ACTIVITIES_DB_PATH", current_dir / "activities.db"))
+
 with open(current_dir / "teachers.json", encoding="utf-8") as teachers_file:
     teachers = json.load(teachers_file)["teachers"]
 
@@ -34,8 +37,8 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
-# In-memory activity database
-activities = {
+# Initial activity catalog used to seed a new database.
+initial_activities = {
     "Chess Club": {
         "description": "Learn strategies and compete in chess tournaments",
         "schedule": "Fridays, 3:30 PM - 5:00 PM",
@@ -93,6 +96,62 @@ activities = {
 }
 
 
+def get_connection():
+    connection = sqlite3.connect(database_path)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def initialize_database():
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    with get_connection() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS activities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT NOT NULL,
+                schedule TEXT NOT NULL,
+                max_participants INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS participants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                activity_id INTEGER NOT NULL,
+                email TEXT NOT NULL,
+                UNIQUE(activity_id, email),
+                FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE
+            );
+            """
+        )
+        activity_count = connection.execute(
+            "SELECT COUNT(*) FROM activities"
+        ).fetchone()[0]
+        if activity_count == 0:
+            for name, activity in initial_activities.items():
+                cursor = connection.execute(
+                    """
+                    INSERT INTO activities (name, description, schedule, max_participants)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        name,
+                        activity["description"],
+                        activity["schedule"],
+                        activity["max_participants"],
+                    ),
+                )
+                connection.executemany(
+                    "INSERT INTO participants (activity_id, email) VALUES (?, ?)",
+                    [
+                        (cursor.lastrowid, email)
+                        for email in activity["participants"]
+                    ],
+                )
+
+
+initialize_database()
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
@@ -100,7 +159,29 @@ def root():
 
 @app.get("/activities")
 def get_activities():
-    return activities
+    with get_connection() as connection:
+        activity_rows = connection.execute(
+            "SELECT * FROM activities ORDER BY name"
+        ).fetchall()
+        participant_rows = connection.execute(
+            "SELECT activity_id, email FROM participants ORDER BY id"
+        ).fetchall()
+
+    participants_by_activity = {}
+    for participant in participant_rows:
+        participants_by_activity.setdefault(participant["activity_id"], []).append(
+            participant["email"]
+        )
+
+    return {
+        activity["name"]: {
+            "description": activity["description"],
+            "schedule": activity["schedule"],
+            "max_participants": activity["max_participants"],
+            "participants": participants_by_activity.get(activity["id"], []),
+        }
+        for activity in activity_rows
+    }
 
 
 @app.get("/auth/me")
@@ -157,25 +238,33 @@ def signup_for_activity(activity_name: str, email: str, request: Request):
     """Sign up a student for an activity"""
     require_teacher(request)
 
-    # Validate activity exists
-    if activity_name not in activities:
-        raise HTTPException(status_code=404, detail="Activity not found")
+    with get_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        activity = connection.execute(
+            "SELECT id, max_participants FROM activities WHERE name = ?",
+            (activity_name,),
+        ).fetchone()
+        if activity is None:
+            raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Get the specific activity
-    activity = activities[activity_name]
+        participant_exists = connection.execute(
+            "SELECT 1 FROM participants WHERE activity_id = ? AND email = ?",
+            (activity["id"], email),
+        ).fetchone()
+        if participant_exists is not None:
+            raise HTTPException(status_code=400, detail="Student is already signed up")
 
-    if len(activity["participants"]) >= activity["max_participants"]:
-        raise HTTPException(status_code=400, detail="Activity is full")
+        participant_count = connection.execute(
+            "SELECT COUNT(*) FROM participants WHERE activity_id = ?",
+            (activity["id"],),
+        ).fetchone()[0]
+        if participant_count >= activity["max_participants"]:
+            raise HTTPException(status_code=400, detail="Activity is full")
 
-    # Validate student is not already signed up
-    if email in activity["participants"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Student is already signed up"
+        connection.execute(
+            "INSERT INTO participants (activity_id, email) VALUES (?, ?)",
+            (activity["id"], email),
         )
-
-    # Add student
-    activity["participants"].append(email)
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
@@ -184,22 +273,23 @@ def unregister_from_activity(activity_name: str, email: str, request: Request):
     """Unregister a student from an activity"""
     require_teacher(request)
 
-    # Validate activity exists
-    if activity_name not in activities:
-        raise HTTPException(status_code=404, detail="Activity not found")
+    with get_connection() as connection:
+        activity = connection.execute(
+            "SELECT id FROM activities WHERE name = ?",
+            (activity_name,),
+        ).fetchone()
+        if activity is None:
+            raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Get the specific activity
-    activity = activities[activity_name]
-
-    # Validate student is signed up
-    if email not in activity["participants"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Student is not signed up for this activity"
+        result = connection.execute(
+            "DELETE FROM participants WHERE activity_id = ? AND email = ?",
+            (activity["id"], email),
         )
-
-    # Remove student
-    activity["participants"].remove(email)
+        if result.rowcount == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Student is not signed up for this activity",
+            )
     return {"message": f"Unregistered {email} from {activity_name}"}
 
 
